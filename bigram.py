@@ -11,6 +11,7 @@ learning_rate = 1e-2
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print("device =", device)
 eval_iters = 200
+adaptive_temperature = False
 # ------------
 
 torch.manual_seed(1337)
@@ -67,11 +68,71 @@ def estimate_loss():
     return out
 
 
+def poly_val(x, coeffs):
+    """
+    Similar to https://arxiv.org/pdf/2410.01104.pdf, we use a polynomial to scale the logits.
+    Evaluate a polynomial with given coeffs (highest degree first).
+    E.g., if coeffs = [a, b, c, d, e], then poly_val(x, coeffs) = a*x^4 + b*x^3 + c*x^2 + d*x + e.
+    """
+    # x is shape (B, 1), so each x**k is broadcast accordingly
+    return (
+        coeffs[0] * x**4
+        + coeffs[1] * x**3
+        + coeffs[2] * x**2
+        + coeffs[3] * x
+        + coeffs[4]
+    )
+
+
+def adapt_temperature(
+    logits: torch.Tensor, probs: torch.Tensor
+) -> torch.Tensor:
+    """
+    Adapt the temperature of the softmax distribution based on the entropy of the distribution.
+    https://arxiv.org/pdf/2410.01104.pdf
+    """
+    # 0) Compute the Shannon entropy of these probabilities
+    #    Use clamp(...) to avoid log(0). Keep dim=-1 for the sum,
+    #    but keepdim=True so we can broadcast easily later.
+    entropy = -torch.sum(
+        probs * torch.log(probs.clamp_min(1e-9)),
+        dim=-1,
+        keepdim=True,
+    )  # (B, 1)
+
+    # 1) Define polynomial fit coefficients for adaptive temperature
+    #    (Same as in the paper’s example: [-0.037, 0.481, -2.3, 4.917, -1.791]).
+    poly_fit = torch.tensor(
+        [-0.037, 0.481, -2.3, 4.917, -1.791],
+        dtype=logits.dtype,
+        device=device,
+    )
+
+    # 2) Compute the temperature scaling factor beta = 1/theta
+    #    If the entropy <= 0.5, leave beta=1.0 to avoid overcorrection
+    #       on low-entropy heads.
+    #    Otherwise, evaluate the polynomial, clamp it at min=1.0 to
+    #       never increase entropy.
+    beta = torch.where(
+        entropy > 0.5,
+        poly_val(entropy, poly_fit).clamp_min(1.0),
+        torch.tensor(1.0, dtype=logits.dtype, device=device),
+    )  # (B, 1)
+
+    # 3) Rescale logits by beta
+    scaled_logits = logits * beta  # broadcast multiply (B, C) * (B, 1)
+
+    # 4) Re-softmax with the scaled logits
+    probs = F.softmax(scaled_logits, dim=-1)  # (B, C)
+    return probs
+
+
 # super simple bigram model
 class BigramLanguageModel(nn.Module):
 
-    def __init__(self, vocab_size):
+    def __init__(self, vocab_size, adaptive_temperature):
         super().__init__()
+        self.adaptive_temperature = adaptive_temperature
         # each token directly reads off the logits for the next token from a
         # lookup table
         self.token_embedding_table = nn.Embedding(vocab_size, vocab_size)
@@ -91,23 +152,11 @@ class BigramLanguageModel(nn.Module):
 
         return logits, loss
 
-    def poly_val(self, x, coeffs):
-        """
-        Similar to https://arxiv.org/pdf/2410.01104.pdf, we use a polynomial to scale the logits.
-        Evaluate a polynomial with given coeffs (highest degree first).
-        E.g., if coeffs = [a, b, c, d, e], then poly_val(x, coeffs) = a*x^4 + b*x^3 + c*x^2 + d*x + e.
-        """
-        # x is shape (B, 1), so each x**k is broadcast accordingly
-        return (
-            coeffs[0] * x**4
-            + coeffs[1] * x**3
-            + coeffs[2] * x**2
-            + coeffs[3] * x
-            + coeffs[4]
-        )
-
-    def generate(self, idx, max_new_tokens):
-        # idx is (B, T) array of indices in the current context
+    def generate(
+        self,
+        idx,  # idx is (B, T) array of indices in the current context
+        max_new_tokens,
+    ):
         for _ in range(max_new_tokens):
             # get the predictions
             logits, loss = self(idx)
@@ -116,49 +165,20 @@ class BigramLanguageModel(nn.Module):
             # apply softmax to get probabilities
             probs = F.softmax(logits, dim=-1)  # (B, C)
 
-            # 4) Compute the Shannon entropy of these probabilities
-            #    Use clamp(...) to avoid log(0). Keep dim=-1 for the sum,
-            #    but keepdim=True so we can broadcast easily later.
-            entropy = -torch.sum(
-                probs * torch.log(probs.clamp_min(1e-9)), dim=-1, keepdim=True
-            )  # (B, 1)
+            if self.adaptive_temperature:
+                probs = adapt_temperature(logits, probs)
 
-            # 5) Define polynomial fit coefficients for adaptive temperature
-            #    (Same as in the paper’s JAX example: [-0.037, 0.481, -2.3, 4.917, -1.791]).
-            poly_fit = torch.tensor(
-                [-0.037, 0.481, -2.3, 4.917, -1.791],
-                dtype=logits.dtype,
-                device=logits.device,
-            )
+            # Sample from the distribution
+            idx_next = torch.multinomial(probs, num_samples=1)  # (B, 1)
 
-            # 6) Compute the temperature scaling factor beta = 1/theta
-            #    If the entropy <= 0.5, leave beta=1.0 to avoid overcorrection
-            #       on low-entropy heads.
-            #    Otherwise, evaluate the polynomial, clamp it at min=1.0 to
-            #       never increase entropy.
-            beta = torch.where(
-                entropy > 0.5,
-                self.poly_val(entropy, poly_fit).clamp_min(1.0),
-                torch.tensor(1.0, dtype=logits.dtype, device=logits.device),
-            )  # (B, 1)
-
-            # 7) Rescale logits by beta
-            scaled_logits = logits * beta  # broadcast multiply (B, C) * (B, 1)
-
-            # 8) Re-softmax with the scaled logits
-            adaptive_probs = F.softmax(scaled_logits, dim=-1)  # (B, C)
-
-            # 9) Sample from the distribution
-            idx_next = torch.multinomial(
-                adaptive_probs, num_samples=1
-            )  # (B, 1)
-
-            # 10) Append sampled index to the running sequence
+            # Append sampled index to the running sequence
             idx = torch.cat((idx, idx_next), dim=1)  # (B, T+1)
         return idx
 
 
-model = BigramLanguageModel(vocab_size)
+model = BigramLanguageModel(
+    vocab_size=vocab_size, adaptive_temperature=adaptive_temperature
+)
 m = model.to(device)
 
 # create a PyTorch optimizer
