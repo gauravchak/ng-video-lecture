@@ -5,24 +5,24 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 # hyperparameters
-batch_size = 64  # how many independent sequences will we process in parallel?
+batch_size = 256  # how many independent sequences will we process in parallel?
 block_size = 256  # what is the maximum context length for predictions?
-max_iters = 5000  # TODO 5000
+max_iters = 2000  # We used 5000 for n_layer=6 and batch_size=64
 eval_interval = 500
 learning_rate = 3e-4
 device = "cuda" if torch.cuda.is_available() else "cpu"
 eval_iters = 200
-n_embd = 32
+n_embd = 384
 n_head = 6
-n_layer = 6
+n_layer = 10
 dropout = 0.2
 adaptive_temperature = False
+source = "filtered.txt"  # "input.txt"
 # ------------
 
 torch.manual_seed(1337)
 
-# wget https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
-with open("input.txt", "r", encoding="utf-8") as f:
+with open(source, "r", encoding="utf-8") as f:
     text = f.read()
 
 # here are all the unique characters that occur in this text
@@ -133,9 +133,10 @@ def adapt_temperature(
 class Head(nn.Module):
     """one head of self-attention"""
 
-    def __init__(self, head_size):
+    def __init__(self, head_size, adaptive_temperature):
         super().__init__()
         self.head_size = head_size
+        self.adaptive_temperature = adaptive_temperature
         self.key = nn.Linear(n_embd, head_size, bias=False)
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
@@ -157,20 +158,25 @@ class Head(nn.Module):
         wei = wei.masked_fill(
             self.tril[:T, :T] == 0, float("-inf")
         )  # (B, T, T)
-        wei = F.softmax(wei, dim=-1)  # (B, T, T)
-        wei = self.dropout(wei)
+        wei_attention = F.softmax(wei, dim=-1)  # (B, T, T)
+        # Currently getting nan
+        # if self.adaptive_temperature:
+        #     wei_attention = adapt_temperature(wei, wei_attention)
+        wei_attention = self.dropout(wei_attention)
         # perform the weighted aggregation of the values
         v = self.value(x)  # (B,T,hs)
-        out = wei @ v  # (B, T, T) @ (B, T, hs) -> (B, T, hs)
+        out = wei_attention @ v  # (B, T, T) @ (B, T, hs) -> (B, T, hs)
         return out
 
 
 class MultiHeadAttention(nn.Module):
     """multiple heads of self-attention in parallel"""
 
-    def __init__(self, num_heads, head_size):
+    def __init__(self, num_heads, head_size, adaptive_temperature):
         super().__init__()
-        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.heads = nn.ModuleList(
+            [Head(head_size, adaptive_temperature) for _ in range(num_heads)]
+        )
         self.proj = nn.Linear(head_size * num_heads, n_embd)
         self.dropout = nn.Dropout(dropout)
 
@@ -200,11 +206,15 @@ class FeedFoward(nn.Module):
 class Block(nn.Module):
     """Transformer block: communication followed by computation"""
 
-    def __init__(self, n_embd, n_head):
+    def __init__(self, n_embd, n_head, adaptive_temperature):
         # n_embd: embedding dimension, n_head: the number of heads we'd like
         super().__init__()
         head_size = n_embd // n_head
-        self.sa = MultiHeadAttention(num_heads=n_head, head_size=head_size)
+        self.sa = MultiHeadAttention(
+            num_heads=n_head,
+            head_size=head_size,
+            adaptive_temperature=adaptive_temperature,
+        )
         self.ffwd = FeedFoward(n_embd)
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
@@ -222,7 +232,18 @@ class MyGPT(nn.Module):
         # token embedding layer
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        self.lm_head = nn.Linear(in_features=n_embd, out_features=vocab_size)
+        self.blocks = nn.Sequential(
+            *[
+                Block(
+                    n_embd,
+                    n_head=n_head,
+                    adaptive_temperature=adaptive_temperature,
+                )
+                for _ in range(n_layer)
+            ]
+        )
+        self.ln_f = nn.LayerNorm(n_embd)  # final layer norm
+        self.lm_head = nn.Linear(n_embd, vocab_size)
 
         # better init, not covered in the original GPT video, but important, will cover in followup video
         self.apply(self._init_weights)
